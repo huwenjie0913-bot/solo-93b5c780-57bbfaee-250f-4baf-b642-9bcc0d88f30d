@@ -106,6 +106,13 @@ class ReviewEngine:
         self._h_warned: Optional[str] = None
         self._d_warned: Optional[str] = None
         self._no_tool_m6_warned = False
+        # 起始点相关（_init_position 会覆盖）
+        self._default_start_used = True
+        self._start_margin = 0.0
+        self._start_machine = _zero3()
+        # 本行待生效的 H/D（补偿切换时区分旧值/新值）
+        self._pending_h: Optional[str] = None
+        self._pending_d: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # 坐标换算
@@ -149,11 +156,25 @@ class ReviewEngine:
     def _init_position(self) -> None:
         env = self.cfg["envelope"]
         sp = self.cfg.get("start_position") or {}
+        # 未显式给定起始点时，选一个对“已配置的最大刀具实体”也安全的包络内角点：
+        # XY 从 min 向内侧让出最大刀具半径，Z 取最高点。这样首段运动（含刀具包络检查）
+        # 不会因为假设的初始点本身贴边/出界而对安全程序误报越界。
+        max_radius = 0.0
+        for tool in self.cfg.get("tools", {}).values():
+            max_radius = max(max_radius, float(tool.get("diameter", 0.0)) / 2.0)
+        for dval in self.cfg.get("d_offsets", {}).values():
+            max_radius = max(max_radius, float(dval))
+        margin = max_radius + 1e-6
         machine = {
-            "x": float(sp["x"]) if sp.get("x") is not None else float(env["xmin"]),
-            "y": float(sp["y"]) if sp.get("y") is not None else float(env["ymin"]),
-            "z": float(sp["z"]) if sp.get("z") is not None else float(env["zmax"]),
+            "x": float(sp["x"]) if sp.get("x") is not None
+            else float(env["xmin"]) + margin,
+            "y": float(sp["y"]) if sp.get("y") is not None
+            else float(env["ymin"]) + margin,
+            "z": float(sp["z"]) if sp.get("z") is not None
+            else float(env["zmax"]),
         }
+        self._default_start_used = not bool(sp)
+        self._start_margin = margin
         self.base_offset = dict(self.cfg["work_offsets"]["G54"])
         self.work_pos = self._to_work(machine)
         self.known_pos = True
@@ -168,9 +189,31 @@ class ReviewEngine:
         b = block
         words = b.words
 
+        # 0) F / S / T / H / D 参数字必须先于 G 代码处理：
+        #    同段 "G00 G43 H1 Z100" 中，G43 分支重映射坐标时就要用到本行的 H，
+        #    否则会按旧 H（多为 0）重映射一次，段末再换用新 H，凭空产生一个刀长跳变。
+        if "F" in words:
+            self.feed_native = words["F"].value
+        if "S" in words:
+            self.spindle_rpm = float(words["S"].value)
+        if "T" in words:
+            new_tool = str(int(words["T"].value)) if words["T"].value == int(
+                words["T"].value) else str(words["T"].value)
+            if self.tool_no is not None and new_tool != self.tool_no and "M06" not in b.m_codes:
+                self._diag("TOOL_WITHOUT_CHANGE", "info", b.line_no,
+                           f"第 {b.line_no} 行 T{new_tool} 预选刀具但本行无 M06，"
+                           f"当前刀具仍为 T{self.tool_no}",
+                           "T 仅刀库预选；刀长/直径要等 M06 后才生效")
+            self.tool_no = new_tool
+        # H/D 字是本行待生效的寄存器选择，先暂存；补偿切换时要先用“旧 H”
+        # 反算物理位置，切到新补偿后再提交新 H，避免切换瞬间混用语义。
+        self._pending_h = self._code_word(words, "H")
+        self._pending_d = self._code_word(words, "D")
+
         # 1) 模态 G 代码分组处理（顺序：单位/平面/距离等先于运动）
         motion_requested: Optional[str] = None
         g53_active = False
+        length_comp_pending: Optional[str] = None
         for g in b.g_codes:
             if g in ("G20", "G21"):
                 new_units = "inch" if g == "G20" else "mm"
@@ -196,14 +239,11 @@ class ReviewEngine:
                 self.cutter_mode = g
                 if g == "G40":
                     self.d_code = None
+                elif self._pending_d is not None:
+                    self.d_code = self._pending_d
             elif g in ("G43", "G44", "G49"):
-                # 补偿切换瞬间机床物理位置不动，按新补偿重映射工件坐标 z
-                machine_z = self._to_machine(self.work_pos)["z"]
-                self.tool_length_mode = g
-                if g == "G49":
-                    self.h_code = None
-                new_work_z = machine_z - self._offset_total()["z"] - self._active_length()
-                self.work_pos["z"] = new_work_z
+                # 补偿代码的处理延迟到 G 循环后（见 length_comp_pending）
+                length_comp_pending = g
             elif g in WORK_OFFSET_KEYS:
                 self._switch_work_offset(g, b.line_no)
             elif g in ("G98", "G99"):
@@ -234,28 +274,22 @@ class ReviewEngine:
             elif g == "G09":
                 pass  # 段内精确停止，不影响几何
 
-        # 2) F / S / T / H / D 参数字
-        if "F" in words:
-            self.feed_native = words["F"].value
-        if "S" in words:
-            self.spindle_rpm = float(words["S"].value)
-        if "T" in words:
-            new_tool = str(int(words["T"].value)) if words["T"].value == int(
-                words["T"].value) else str(words["T"].value)
-            if self.tool_no is not None and new_tool != self.tool_no and "M06" not in b.m_codes:
-                self._diag("TOOL_WITHOUT_CHANGE", "info", b.line_no,
-                           f"第 {b.line_no} 行 T{new_tool} 预选刀具但本行无 M06，"
-                           f"当前刀具仍为 T{self.tool_no}",
-                           "T 仅刀库预选；刀长/直径要等 M06 后才生效")
-            self.tool_no = new_tool
-        if "H" in words and self.tool_length_mode in ("G43", "G44"):
-            self.h_code = str(int(words["H"].value)) if words["H"].value == int(
-                words["H"].value) else str(words["H"].value)
-        if "D" in words and self.cutter_mode in ("G41", "G42"):
-            self.d_code = str(int(words["D"].value)) if words["D"].value == int(
-                words["D"].value) else str(words["D"].value)
+        # 2) 长度补偿切换（G43/G44/G49）：
+        #    当前点始终按“当前生效补偿”的工件坐标表示，故切换时物理位置不动、
+        #    先按新补偿重映射当前点；本行的 Z 目标若存在，则按 Fanuc 语义视为
+        #    “新补偿生效后的工件坐标”，在运动执行前覆盖重映射后的当前 z。
+        if length_comp_pending is not None:
+            self._apply_length_comp(length_comp_pending, b,
+                                    has_z="Z" in words)
+        elif self._pending_h is not None and self.tool_length_mode in ("G43", "G44"):
+            # 补偿已激活、本行仅换 H 号：物理位置不动，按新刀重重映射 work z
+            self._apply_length_comp(self.tool_length_mode, b, has_z="Z" in words)
 
-        # G43/G44 同行 H 已处理；校验补偿号
+        if self._pending_d is not None and self.cutter_mode in ("G41", "G42"):
+            # G41/G42 已激活时本行仅换 D 号（无位置重映射，刀径不改变刀位点）
+            self.d_code = self._pending_d
+
+        # 补偿号校验（F/S/T/H/D 已登记）
         if self.tool_length_mode in ("G43", "G44"):
             self._check_h_defined(b.line_no)
         if self.cutter_mode in ("G41", "G42"):
@@ -291,6 +325,30 @@ class ReviewEngine:
     def _to_mm(self, value: float) -> float:
         return value * _INCH if self.units == "inch" else value
 
+    @staticmethod
+    def _code_word(words, letter) -> Optional[str]:
+        w = words.get(letter)
+        if w is None:
+            return None
+        return str(int(w.value)) if w.value == int(w.value) else str(w.value)
+
+    def _apply_length_comp(self, code: str, block, has_z: bool) -> None:
+        """切换 G43/G44/G49：物理位置不动，当前工件坐标 z 按新补偿重映射。
+
+        反算物理点时仍用“旧 H/旧模式”，提交模式后再用“新 H”重映射，
+        避免同段 G43 Hn 提前覆盖 H 号造成刀长跳变。
+        随后的 Z 目标解析（绝对 G90 给新坐标，增量 G91 累加）符合 Fanuc 行为：
+        "G43 H1 Z100" 物理终点 = 零点偏置 + 100 + 新刀长。
+        """
+        machine_z = self._to_machine(self.work_pos)["z"]  # 旧补偿
+        self.tool_length_mode = code
+        if code == "G49":
+            self.h_code = None
+        elif self._pending_h is not None:
+            self.h_code = self._pending_h
+        new_work_z = machine_z - self._offset_total()["z"] - self._active_length()
+        self.work_pos["z"] = new_work_z
+
     def _target(self, block, axes: Tuple[str, ...], g53: bool = False) -> Dict[str, float]:
         """根据 G90/G91 与单位解析轴目标（返回出现的轴）。"""
         out: Dict[str, float] = {}
@@ -324,14 +382,17 @@ class ReviewEngine:
             self.units = "mm"
             self.assumptions.append("程序未声明单位，按 G21 毫米处理")
         if not self._start_noted:
-            self._diag("INITIAL_POSITION_ASSUMED", "info", block.line_no,
-                       "程序未用 G28/G53 建立初始位置，起始点取机床包络安全角点",
-                       f"假设初始机床坐标 X{_fmt(self._start_machine['x'])} "
-                       f"Y{_fmt(self._start_machine['y'])} Z{_fmt(self._start_machine['z'])}"
-                       "（可在 config.start_position 中指定）")
-            self.assumptions.append(
-                "初始机床位置取 xmin/ymin/zmax（可用 start_position 覆盖）")
             self._start_noted = True
+            if self._default_start_used:
+                self._diag("INITIAL_POSITION_ASSUMED", "info", block.line_no,
+                           "程序未用 G28/G53 建立初始位置，起始点取机床包络内的安全角点",
+                           f"假设初始机床坐标 X{_fmt(self._start_machine['x'])} "
+                           f"Y{_fmt(self._start_machine['y'])} Z{_fmt(self._start_machine['z'])}"
+                           f"（XY 已内缩最大刀具半径 {_fmt(self._start_margin)}mm，"
+                           "Z 取 zmax；可在 config.start_position 中指定）")
+                self.assumptions.append(
+                    f"初始机床位置取包络安全角点（内缩刀具半径 {_fmt(self._start_margin)}mm，"
+                    "可用 start_position 覆盖）")
 
     def _execute_motion(self, block, code: str, g53: bool) -> None:
         self._first_move_guard(block)
@@ -903,11 +964,14 @@ class ReviewEngine:
                            "未定义刀具的长度/直径未知，首件存在撞机风险",
                            pre_state=pre)
             else:
+                tool_row = self.cfg["tools"].get(str(self.tool_no), {})
                 self._diag("TOOL_CHANGE", "info", line_no,
                            f"第 {line_no} 行换刀 T{self.tool_no}，"
-                           f"刀长 {_fmt(tool_length(self.cfg, self.h_code, self.tool_no))}mm、"
-                           f"直径 {_fmt(self.cfg['tools'].get(str(self.tool_no), {}).get('diameter', 0.0))}mm",
-                           "刀具几何取自 config.tools / h_offsets",
+                           f"刀长 {_fmt(tool_row.get('length', 0.0))}mm、"
+                           f"直径 {_fmt(tool_row.get('diameter', 0.0))}mm"
+                           + (f"（{tool_row.get('description')}）"
+                              if tool_row.get("description") else ""),
+                           "刀具几何取自 config.tools；长度补偿需后续 G43 H 才生效",
                            pre_state=pre)
             self.t_toolchange += float(self.cfg["tool_change_time"])
             # 换刀后长度/半径补偿模态按 Fanuc 习惯取消，等待重新 G43/G41

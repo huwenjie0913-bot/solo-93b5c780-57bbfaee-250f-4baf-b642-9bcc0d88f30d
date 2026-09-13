@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcode-review"
+version = "0.1.0"
+description = "G-code 静态审查服务：上传数控程序，按机床配置重建运动轨迹并诊断撞机风险"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "Flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+gcode-review = "gcode_review.app:main"
+
+[tool.setuptools]
+packages = ["gcode_review"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+python_files = ["test_*.py"]

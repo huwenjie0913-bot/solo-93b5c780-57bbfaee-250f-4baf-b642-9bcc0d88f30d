@@ -66,31 +66,27 @@ G49 M30
     d = next(d for d in env if "X 轴" in d["message"])
     assert d["segment_index"] is not None
     assert d["preceding_state"]["work_offset"] == "G54"
-    assert "xmax=300" in d["basis"]
+    assert "行程限制 320mm" in d["basis"]
 
 
 def test_tool_diameter_counts_in_envelope(base_config):
-    """刀具半径 5mm：work x=456 -> machine 306，加半径 311 越界；不加半径则 306 也越界。"""
+    """work x=470 -> machine 320 恰在 xmax；计入刀具半径 5 -> 325 越界。"""
     prog = """G21 G90 G54
 T1 M06
 G00 G43 H1 Z80.
 M03 S1000
-G00 X451 Y0
+G00 X470 Y0
 M05
 G49 M30
 """
-    # work x=451 -> machine 301；加半径 5 -> 306 越界
     rep = review_program(prog, base_config)
     assert any(d["code"] == "ENVELOPE_VIOLATION" and "X" in d["message"]
                for d in rep["diagnostics"])
-    base_config["check_tool_envelope"] = False
-    rep2 = review_program(prog, base_config)
-    # 301 仍越界（xmax=300）；改成 450 -> 300 边界：计入半径越界，关闭则不越界
-    prog_edge = prog.replace("X451", "X450")
-    rep3 = review_program(prog_edge, {**base_config, "check_tool_envelope": True})
-    rep4 = review_program(prog_edge, {**base_config, "check_tool_envelope": False})
-    assert any(d["code"] == "ENVELOPE_VIOLATION" for d in rep3["diagnostics"])
-    assert not any(d["code"] == "ENVELOPE_VIOLATION" for d in rep4["diagnostics"])
+    # 关闭刀具实体检查后，320 正好贴边不越界
+    rep4 = review_program(prog, {**base_config, "check_tool_envelope": False})
+    x_hits = [d for d in rep4["diagnostics"]
+              if d["code"] == "ENVELOPE_VIOLATION" and "X 轴" in d["message"]]
+    assert not x_hits
 
 
 def test_undefined_tool_on_m06(base_config):
@@ -238,11 +234,11 @@ G49 M30
     rep = review_program(prog, base_config)
     assert rep["units"] == "inch"
     moves = rep["moves"]
-    # 初始 machine x=xmin=-300；+1in(25.4mm) 后 -274.6
-    assert any(abs(m["end_machine"]["x"] + 274.6) < 1e-6 for m in moves)
-    # 切削 -0.5in -> -287.3
+    # 初始 machine x = xmin+刀具半径 = -315；+1in(25.4mm) 后 -289.6
+    assert any(abs(m["end_machine"]["x"] + 289.6) < 1e-6 for m in moves)
+    # 切削 -0.5in(12.7mm) -> -302.3
     cut = [m for m in moves if m["kind"] == "linear"]
-    assert cut and abs(cut[0]["end_machine"]["x"] + 287.3) < 1e-6
+    assert cut and abs(cut[0]["end_machine"]["x"] + 302.3) < 1e-6
     # F10 in/min = 254 mm/min
     assert cut[0]["feed_mm_min"] == 254.0
 
@@ -502,7 +498,7 @@ G49 M30
     # machine z 最低点 = 0-300+120 = -180
     assert abs(bm["min"]["z"] + 180.0) < 1e-6
     assert rep["time_estimate_s"]["total"] > 0
-    assert "rapid" in rep["time_basis"]
+    assert "快移" in rep["time_basis"]
 
 
 def test_preceding_state_attached(base_config):

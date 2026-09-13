@@ -223,5 +223,21 @@ def create_app(db_path: str = None) -> Flask:
     return app
 
 
+def main() -> None:
+    """控制台入口：python -m gcode_review / 安装后的 gcode-review 命令。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="G-code 静态审查 API 服务")
+    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PORT", 5000)))
+    parser.add_argument("--db", default=os.environ.get("GCODE_DB_PATH"),
+                        help="SQLite 库路径（默认 ./gcode_review.db）")
+    args = parser.parse_args()
+
+    app = create_app(args.db)
+    app.run(host=args.host, port=args.port)
+
+
 if __name__ == "__main__":
-    create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    main()

@@ -19,7 +19,7 @@ _WORD_RE = re.compile(
 # 合法词字母白名单（N/O 单独处理）
 _WORD_LETTERS = set("XYZABCUVWIJKRFHSDTLP")
 _AXIS_LETTERS = set("XYZABCUVW")
-_PARAM_LETTERS = set("IJKRFHSDTLP")
+_PARAM_LETTERS = set("IJKRFHSDTLPQ")
 
 
 def _strip_comment(line: str) -> Tuple[str, List[str]]:
