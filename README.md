@@ -57,6 +57,13 @@ G73/G74/G76/G81–G89、G28/G30、G04 等；内部统一换算为毫米与机床
 `safety_clearance`、刀具表 `tools`（刀长/直径）、`h_offsets`/`d_offsets`、
 快移与默认进给速度、可选 `start_position`、`arc_tolerance` 等，全部以毫米为单位。
 
+配置保存（`POST /api/configs`）与内联审查（`POST /api/review`、
+`/api/review/program/<id>`、`/api/compare`）都会校验配置：`envelope`、
+`work_offsets`、`tools`、`h_offsets`、`d_offsets` 必须是对象；尺寸、坐标与
+安全参数必须是有限数值（拒绝 NaN/无穷）。校验失败返回
+`400 {"error": "配置校验失败：…", "details": ["…", "…"]}`，
+`details` 为逐条结构化错误列表。
+
 ## 测试
 
 ```bash

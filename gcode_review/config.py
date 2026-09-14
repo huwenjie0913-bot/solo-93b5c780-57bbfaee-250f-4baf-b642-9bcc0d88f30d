@@ -12,6 +12,16 @@ from typing import Any, Dict, List, Tuple
 WORK_OFFSET_KEYS = [f"G5{n}" for n in range(4, 10)]  # G54..G59
 _AXES = ("x", "y", "z")
 _ENVELOPE_KEYS = {f"{a}{b}" for a in _AXES for b in ("min", "max")}
+# 必须为对象（JSON object）的配置节；类型错误时归一化容错回退默认值
+_SECTION_KEYS = ("envelope", "work_offsets", "tools", "h_offsets", "d_offsets")
+
+
+class ConfigValidationError(ValueError):
+    """配置校验失败：携带结构化错误列表，便于 API 返回 details。"""
+
+    def __init__(self, errors):
+        self.errors = [str(e) for e in errors]
+        super().__init__("配置校验失败：" + "；".join(self.errors))
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "name": "default",
@@ -65,41 +75,85 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 def normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """用默认值补全并深拷贝出一份完整配置（不校验数值，仅补默认）。"""
-    cfg = _deep_merge(_deepcopy_default(), raw or {})
-    # 刀具/H/D 键统一成字符串，数值转 float
-    cfg["tools"] = {str(k): _normalize_tool(v) for k, v in (cfg.get("tools") or {}).items()}
-    cfg["h_offsets"] = {str(k): float(v) for k, v in (cfg.get("h_offsets") or {}).items()}
-    cfg["d_offsets"] = {str(k): float(v) for k, v in (cfg.get("d_offsets") or {}).items()}
+    """用默认值补全并深拷贝出一份完整配置（不校验数值，仅补默认）。
+
+    非对象的 tools/h_offsets/d_offsets/envelope/work_offsets 容错回退为默认值，
+    保证归一化自身不因 .items()/.get() 抛 AttributeError；
+    类型错误由 validate_config 基于原始输入报告。
+    """
+    cfg = _deep_merge(_deepcopy_default(), raw if isinstance(raw, dict) else {})
+    fallback = _deepcopy_default()
+    for section in _SECTION_KEYS:
+        if not isinstance(cfg.get(section), dict):
+            cfg[section] = fallback[section]
+    if cfg.get("start_position") is not None \
+            and not isinstance(cfg.get("start_position"), dict):
+        cfg["start_position"] = None
+    # 刀具/H/D 键统一成字符串；数值尽力转 float，失败留 None 由校验报告
+    cfg["tools"] = {str(k): _normalize_tool(v) for k, v in cfg["tools"].items()}
+    cfg["h_offsets"] = {str(k): _num(v) for k, v in cfg["h_offsets"].items()}
+    cfg["d_offsets"] = {str(k): _num(v) for k, v in cfg["d_offsets"].items()}
     cfg["obstacles"] = _normalize_obstacles(cfg.get("obstacles"))
     return cfg
 
 
 def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """校验配置。返回 (归一化配置, 错误消息列表)；列表为空表示通过。"""
+    if not isinstance(raw, dict):
+        return normalize_config({}), ["配置必须是对象（JSON object）"]
     errors: List[str] = []
+
+    # 结构性类型检查：五大节必须是对象，否则归一化只能容错回退默认值
+    for section in _SECTION_KEYS:
+        if section in raw and not isinstance(raw[section], dict):
+            errors.append(f"{section} 必须是对象（JSON object）")
+    if isinstance(raw.get("tools"), dict):
+        for tnum, tval in raw["tools"].items():
+            if not isinstance(tval, dict):
+                errors.append(f"tools.{tnum} 必须是对象")
+
     cfg = normalize_config(raw)
 
     env = cfg["envelope"]
     for key in _ENVELOPE_KEYS:
-        if not isinstance(env.get(key), (int, float)) or math.isnan(float(env[key])):
-            errors.append(f"envelope.{key} 必须是数值")
+        if not _ok_num(env.get(key)):
+            errors.append(f"envelope.{key} 必须是有限数值（拒绝 NaN/无穷）")
     for ax in _AXES:
         lo, hi = env.get(f"{ax}min"), env.get(f"{ax}max")
-        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo > hi:
+        if _ok_num(lo) and _ok_num(hi) and lo > hi:
             errors.append(f"envelope.{ax}min({lo}) 不得大于 {ax}max({hi})")
 
-    if not isinstance(cfg["safety_clearance"], (int, float)):
-        errors.append("safety_clearance 必须是数值")
-    elif cfg["safety_clearance"] < env.get("zmin", -1e18) - 1e-9:
-        errors.append("safety_clearance 低于机床 zmin，安全平面无意义")
+    sc = cfg["safety_clearance"]
+    if not _ok_num(sc):
+        errors.append("safety_clearance 必须是有限数值（拒绝 NaN/无穷）")
+    else:
+        zmin = env.get("zmin")
+        if _ok_num(zmin) and sc < zmin - 1e-9:
+            errors.append("safety_clearance 低于机床 zmin，安全平面无意义")
 
     for key in WORK_OFFSET_KEYS:
         off = cfg["work_offsets"].get(key)
         if not isinstance(off, dict) or any(a not in off for a in _AXES):
             errors.append(f"work_offsets.{key} 必须含 x/y/z")
-        elif any(not isinstance(off[a], (int, float)) for a in _AXES):
-            errors.append(f"work_offsets.{key} 的 x/y/z 必须是数值")
+        elif any(not _ok_num(off[a]) for a in _AXES):
+            errors.append(f"work_offsets.{key} 的 x/y/z 必须是有限数值（拒绝 NaN/无穷）")
+
+    # H/D 补偿寄存器值必须有限（NaN 会污染刀长/半径换算，产生 nan 轨迹）
+    for reg_name in ("h_offsets", "d_offsets"):
+        for reg, val in cfg.get(reg_name, {}).items():
+            if not _ok_num(val):
+                errors.append(f"{reg_name}.{reg} 必须是有限数值（拒绝 NaN/无穷）")
+
+    # 可选起始点：机床坐标必须有限（非对象类型在归一化中被容错为 None，须查原始输入）
+    if "start_position" in raw and raw["start_position"] is not None \
+            and not isinstance(raw["start_position"], dict):
+        errors.append("start_position 必须是对象（含 x/y/z 机床坐标）")
+    else:
+        sp = cfg.get("start_position")
+        if isinstance(sp, dict):
+            for a in _AXES:
+                if sp.get(a) is not None and not _ok_num(sp[a]):
+                    errors.append(f"start_position.{a} 必须是有限数值（拒绝 NaN/无穷）")
 
     for tnum, tool in cfg["tools"].items():
         if not isinstance(tool, dict):
@@ -132,7 +186,7 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
             errors.append(f"tools.{tnum}.diameter 大于机床行程，配置可疑")
 
     # ---- 障碍物：尺寸、坐标、唯一标识 ----
-    if "obstacles" in (raw or {}) and not isinstance(raw.get("obstacles"), list):
+    if "obstacles" in raw and not isinstance(raw["obstacles"], list):
         errors.append("obstacles 必须是数组（box/cylinder 对象列表）")
     seen_obstacle_ids = set()
     for i, ob in enumerate(cfg.get("obstacles") or []):
@@ -184,11 +238,11 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     for fld in ("rapid_speed", "default_feed", "default_spindle",
                 "tool_change_time", "arc_tolerance"):
         v = cfg.get(fld)
-        if not isinstance(v, (int, float)) or v <= 0:
-            errors.append(f"{fld} 必须为正数")
+        if not _ok_num(v) or v <= 0:
+            errors.append(f"{fld} 必须为正数（有限数值，拒绝 NaN/无穷）")
 
     for name in ("rapid_speed", "default_feed", "default_spindle"):
-        if isinstance(cfg.get(name), (int, float)) and cfg[name] > 120000:
+        if _ok_num(cfg.get(name)) and cfg[name] > 120000:
             errors.append(f"{name}={cfg[name]} 超出合理上限 120000")
 
     return cfg, errors
@@ -197,20 +251,20 @@ def validate_config(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
 def tool_length(cfg: Dict[str, Any], h_code: str, tool_no: str = None) -> float:
     """取生效长度补偿：优先 h_offsets[H]；H 号与刀号相同时回退到该刀 length；否则 0。"""
     if h_code is not None and h_code in cfg.get("h_offsets", {}):
-        return float(cfg["h_offsets"][h_code])
+        return _finite_or_zero(cfg["h_offsets"][h_code])
     if tool_no is not None and h_code == str(tool_no) \
             and str(tool_no) in cfg.get("tools", {}):
-        return float(cfg["tools"][str(tool_no)].get("length", 0.0))
+        return _finite_or_zero(cfg["tools"][str(tool_no)].get("length", 0.0))
     return 0.0
 
 
 def cutter_radius(cfg: Dict[str, Any], d_code: str, tool_no: str = None) -> float:
     """取生效半径补偿：优先 d_offsets[D]；D 号与刀号相同时回退到该刀半径；否则 0。"""
     if d_code is not None and d_code in cfg.get("d_offsets", {}):
-        return float(cfg["d_offsets"][d_code])
+        return _finite_or_zero(cfg["d_offsets"][d_code])
     if tool_no is not None and d_code == str(tool_no) \
             and str(tool_no) in cfg.get("tools", {}):
-        return float(cfg["tools"][str(tool_no)].get("diameter", 0.0)) / 2.0
+        return _finite_or_zero(cfg["tools"][str(tool_no)].get("diameter", 0.0)) / 2.0
     return 0.0
 
 
@@ -224,6 +278,11 @@ def _num(v: Any):
 
 def _ok_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def _finite_or_zero(v: Any) -> float:
+    """有限数值原样返回；None/NaN/无穷/非数值回退 0（避免 nan 污染轨迹重建）。"""
+    return float(v) if _ok_num(v) else 0.0
 
 
 def _pos(v: Any) -> bool:

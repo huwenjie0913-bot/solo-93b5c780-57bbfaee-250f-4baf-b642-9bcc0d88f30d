@@ -8,7 +8,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .config import validate_config
+from .config import ConfigValidationError, validate_config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS programs (
@@ -73,10 +73,10 @@ class Database:
     # ------------------------------------------------------------------ #
     def save_config(self, name: str, config: Dict[str, Any],
                     note: str = "") -> Tuple[int, int]:
-        """保存新版本。返回 (id, version)。校验失败抛 ValueError。"""
+        """保存新版本。返回 (id, version)。校验失败抛 ConfigValidationError。"""
         cfg, errors = validate_config({**config, "name": name})
         if errors:
-            raise ValueError("；".join(errors))
+            raise ConfigValidationError(errors)
         row = self._conn.execute(
             "SELECT MAX(version) AS v FROM machine_configs WHERE name=?", (name,)
         ).fetchone()

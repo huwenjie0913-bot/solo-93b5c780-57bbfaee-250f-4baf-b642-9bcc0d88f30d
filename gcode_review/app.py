@@ -22,7 +22,8 @@ from typing import Any, Dict, Tuple
 from flask import Flask, jsonify, request
 
 from .compare import compare_reviews
-from .config import DEFAULT_CONFIG, normalize_config, validate_config
+from .config import (DEFAULT_CONFIG, ConfigValidationError, normalize_config,
+                     validate_config)
 from .db import Database
 from .engine import review_program
 
@@ -42,6 +43,19 @@ def create_app(db_path: str = None) -> Flask:
         payload = {"error": message}
         payload.update(extra)
         return jsonify(payload), status
+
+    def json_object():
+        """解析请求 JSON 对象体。无 JSON 体返回 {}；JSON 不是对象返回 None。"""
+        body = request.get_json(silent=True)
+        if body is None:
+            return {}
+        return body if isinstance(body, dict) else None
+
+    def config_exc_response(e: Exception):
+        """配置引用/校验异常的统一响应：校验错误带结构化 details 列表。"""
+        if isinstance(e, ConfigValidationError):
+            return err(400, str(e), details=e.errors)
+        return err(400 if isinstance(e, ValueError) else 404, str(e))
 
     def get_program_content(payload, files) -> Tuple[str, str]:
         """返回 (name, content)。"""
@@ -74,10 +88,12 @@ def create_app(db_path: str = None) -> Flask:
                     f"机床配置 {body['config_name']} "
                     f"v{body.get('config_version', 'latest')} 不存在")
             return row["config"]
-        if isinstance(body.get("config"), dict):
+        if "config" in body:
+            if not isinstance(body["config"], dict):
+                raise ValueError("config 必须是对象（JSON object）")
             cfg, errors = validate_config(body["config"])
             if errors:
-                raise ValueError("配置校验失败：" + "；".join(errors))
+                raise ConfigValidationError(errors)
             return cfg
         # 未给配置：用默认配置
         return normalize_config(DEFAULT_CONFIG)
@@ -90,9 +106,13 @@ def create_app(db_path: str = None) -> Flask:
     # ---------------- 程序 --------------------------------------------- #
     @app.post("/api/programs")
     def upload_program():
+        payload = request.form
+        if not payload:
+            payload = json_object()
+            if payload is None:
+                return err(400, "请求体必须是 JSON 对象")
         try:
-            name, content = get_program_content(request.form or request.get_json(silent=True),
-                                                request.files)
+            name, content = get_program_content(payload, request.files)
         except ValueError as e:
             return err(400, str(e))
         if not content.strip():
@@ -115,7 +135,9 @@ def create_app(db_path: str = None) -> Flask:
     # ---------------- 配置 --------------------------------------------- #
     @app.post("/api/configs")
     def create_config():
-        body = request.get_json(silent=True) or {}
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
         name = body.get("name")
         if not name or not isinstance(name, str):
             return err(400, "需要 name（配置名称）")
@@ -124,6 +146,8 @@ def create_app(db_path: str = None) -> Flask:
             return err(400, "需要 config（机床配置对象）")
         try:
             cid, version = db.save_config(name, raw, note=body.get("note", ""))
+        except ConfigValidationError as e:
+            return err(400, str(e), details=e.errors)
         except ValueError as e:
             return err(400, str(e))
         return jsonify({"id": cid, "name": name, "version": version}), 201
@@ -142,7 +166,9 @@ def create_app(db_path: str = None) -> Flask:
     # ---------------- 审查 --------------------------------------------- #
     @app.post("/api/review")
     def review_inline():
-        body = request.get_json(silent=True) or {}
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
         content = body.get("content")
         name = body.get("name", "inline.gcode")
         pid = body.get("program_id")
@@ -156,7 +182,7 @@ def create_app(db_path: str = None) -> Flask:
         try:
             cfg = resolve_config(body)
         except (ValueError, LookupError) as e:
-            return err(400 if isinstance(e, ValueError) else 404, str(e))
+            return config_exc_response(e)
         return jsonify(review_program(content, cfg, filename=name))
 
     @app.post("/api/review/program/<int:pid>")
@@ -164,17 +190,21 @@ def create_app(db_path: str = None) -> Flask:
         row = db.get_program(pid)
         if not row:
             return err(404, f"程序 {pid} 不存在")
-        body = request.get_json(silent=True) or {}
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
         try:
             cfg = resolve_config(body)
         except (ValueError, LookupError) as e:
-            return err(400 if isinstance(e, ValueError) else 404, str(e))
+            return config_exc_response(e)
         return jsonify(review_program(row["content"], cfg, filename=row["name"]))
 
     # ---------------- 比对 --------------------------------------------- #
     @app.post("/api/compare")
     def compare():
-        body = request.get_json(silent=True) or {}
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
         pid = body.get("program_id")
         content = body.get("content")
         name = body.get("name", "inline.gcode")
@@ -201,7 +231,7 @@ def create_app(db_path: str = None) -> Flask:
             if isinstance(spec, dict):
                 cfg, errors = validate_config(spec)
                 if errors:
-                    raise ValueError("配置校验失败：" + "；".join(errors))
+                    raise ConfigValidationError(errors)
                 return cfg
             raise ValueError("config_a/config_b 必须是配置对象或配置引用")
 
@@ -209,7 +239,7 @@ def create_app(db_path: str = None) -> Flask:
             cfg_a = one_cfg(body.get("config_a"))
             cfg_b = one_cfg(body.get("config_b"))
         except (ValueError, LookupError) as e:
-            return err(400 if isinstance(e, ValueError) else 404, str(e))
+            return config_exc_response(e)
         return jsonify(compare_reviews(content, cfg_a, cfg_b, filename=name))
 
     @app.errorhandler(404)
