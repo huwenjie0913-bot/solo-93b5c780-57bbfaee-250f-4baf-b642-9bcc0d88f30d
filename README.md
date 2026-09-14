@@ -52,6 +52,10 @@ G73/G74/G76/G81–G89、G28/G30、G04 等；内部统一换算为毫米与机床
 | POST | `/api/review` | 即时审查（内联 `content` 或 `program_id` + 配置引用/内联配置） |
 | POST | `/api/review/program/<id>` | 对已存程序审查 |
 | POST | `/api/compare` | 同一程序在两套配置（`config_a`/`config_b`）下的风险差异 |
+| POST | `/api/tool-life/records` | 批量导入刀具磨损记录（`tools` 数组或单条 `tool_id`+`records`） |
+| GET | `/api/tool-life/records`, `/api/tool-life/records/<tool_id>` | 刀具记录汇总 / 详情 |
+| POST | `/api/tool-life/predict` | 即时寿命预测（内联 `records` 或已存 `tool_id` + 本次 `condition`） |
+| POST | `/api/tool-life/predict/<tool_id>` | 对已存刀具预测；加 `?download=1` 以附件导出结果 JSON |
 
 配置支持：机床六向行程 `envelope`、G54–G59 工件零点 `work_offsets`、安全平面
 `safety_clearance`、刀具表 `tools`（刀长/直径）、`h_offsets`/`d_offsets`、
@@ -63,6 +67,42 @@ G73/G74/G76/G81–G89、G28/G30、G04 等；内部统一换算为毫米与机床
 安全参数必须是有限数值（拒绝 NaN/无穷）。校验失败返回
 `400 {"error": "配置校验失败：…", "details": ["…", "…"]}`，
 `details` 为逐条结构化错误列表。
+
+## 刀具寿命预测
+
+加工任务完成后，可根据刀具历史磨损记录与本次材料、转速、进给、切削深度，
+估算刀具还能安全工作多久。模块对磨损记录（累计切削时间 → 磨损量）做线性
+最小二乘拟合，外推到磨钝标准（默认 VB=0.3mm）得总寿命，再用扩展 Taylor
+经验公式按本次工况相对历史工况的偏离修正剩余寿命（转速/进给/切削深度指数
+默认 4/2/1，可在 `life_config` 中调整）。
+
+磨损记录字段：`cutting_time_min`（累计切削时间）、`wear_mm`（磨损量）为必传，
+`speed_rpm`/`feed_mm_min`/`depth_mm`（该段历史工况）可选。批量导入示例：
+
+```json
+POST /api/tool-life/records
+{"tools": [{"tool_id": "T1", "material": "45钢",
+            "records": [{"cutting_time_min": 10, "wear_mm": 0.04,
+                         "speed_rpm": 2000, "feed_mm_min": 300, "depth_mm": 2},
+                        {"cutting_time_min": 20, "wear_mm": 0.06, "...": "..."}]}]}
+```
+
+预测请求：`condition` 为本次工况（`speed_rpm`/`feed_mm_min`/`depth_mm`，可选
+`material` 与 `material_factor` 材料系数）；`life_config` 可覆盖磨钝标准、
+置信水平、Taylor 指数、安全阈值（`max_speed_rpm`/`max_feed_mm_min`/
+`max_depth_mm`）等。响应包含：
+
+* `prediction`：剩余寿命 `remaining_min`、总寿命 `total_life_min` 及
+  置信区间（`remaining_ci_min`/`total_life_ci_min`，delta 法由回归残差传播）；
+* `factors`：转速/进给/切削深度各自的寿命影响系数、影响占比与文字说明，
+  占比最高者即主要影响因素；
+* `threshold_violations`：本次工况中超出安全阈值的参数及处置建议；
+* `anomalies`：可解释异常提示（磨损回退疑似测量误差、记录数不足、
+  R² 过低、材料不一致未修正、剩余寿命低于安全余量等）；
+* `verdict`：一句话结论。
+
+数据校验失败返回 `400 {"error": "刀具寿命数据校验失败：…", "details": [...]}`，
+风格与配置校验一致。预测响应加 `?download=1` 即可以附件形式导出 JSON 结果。
 
 ## 测试
 

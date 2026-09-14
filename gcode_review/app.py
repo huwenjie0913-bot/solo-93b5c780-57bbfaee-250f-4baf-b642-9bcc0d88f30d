@@ -11,11 +11,17 @@
 * POST /api/review                   即时审查（程序 id 或内联文本 + 配置）
 * POST /api/review/program/<pid>     已存程序审查（配置 id/name+version 或内联）
 * POST /api/compare                  同一程序两套配置的风险差异
+* POST /api/tool-life/records        批量导入刀具磨损记录
+* GET  /api/tool-life/records        刀具记录汇总列表
+* GET  /api/tool-life/records/<tid>  某刀具磨损记录详情
+* POST /api/tool-life/predict        即时寿命预测（内联记录或 tool_id + 本次工况）
+* POST /api/tool-life/predict/<tid>  已存刀具寿命预测（?download=1 导出 JSON）
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from typing import Any, Dict, Tuple
 
@@ -26,6 +32,7 @@ from .config import (DEFAULT_CONFIG, ConfigValidationError, normalize_config,
                      validate_config)
 from .db import Database
 from .engine import review_program
+from .tool_life import LifeValidationError, predict_tool_life, validate_records
 
 
 def create_app(db_path: str = None) -> Flask:
@@ -198,6 +205,110 @@ def create_app(db_path: str = None) -> Flask:
         except (ValueError, LookupError) as e:
             return config_exc_response(e)
         return jsonify(review_program(row["content"], cfg, filename=row["name"]))
+
+    # ---------------- 刀具寿命 ----------------------------------------- #
+    def maybe_download(report: Dict[str, Any], filename: str):
+        """?download=1 时以附件形式导出 JSON 结果，否则正常 JSON 响应。"""
+        if request.args.get("download"):
+            resp = app.response_class(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                mimetype="application/json")
+            resp.headers["Content-Disposition"] = \
+                f"attachment; filename={filename}"
+            return resp
+        return jsonify(report)
+
+    @app.post("/api/tool-life/records")
+    def import_tool_life_records():
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
+        tools = body.get("tools")
+        if tools is None:
+            # 兼容单刀具直接提交：{tool_id, material, records}
+            if body.get("tool_id") is not None:
+                tools = [body]
+            else:
+                return err(400, "需要 tools（刀具记录数组）或单条 tool_id+records")
+        if not isinstance(tools, list) or not tools:
+            return err(400, "tools 必须是非空数组")
+        imported, failed = [], []
+        for i, item in enumerate(tools):
+            if not isinstance(item, dict):
+                failed.append({"index": i, "errors": ["必须是对象（JSON object）"]})
+                continue
+            tool_id = item.get("tool_id")
+            if not tool_id or not isinstance(tool_id, str):
+                failed.append({"index": i, "tool_id": tool_id,
+                               "errors": ["需要 tool_id（刀具标识字符串）"]})
+                continue
+            records, rec_errors, _anomalies = validate_records(
+                item.get("records"), min_count=1)
+            if rec_errors:
+                failed.append({"index": i, "tool_id": tool_id,
+                               "errors": rec_errors})
+                continue
+            n = db.upsert_tool_life_records(
+                tool_id, str(item.get("material", "")), records)
+            imported.append({"tool_id": tool_id, "records": n})
+        payload: Dict[str, Any] = {"imported": imported, "failed": failed}
+        if not imported:
+            payload["error"] = "没有可导入的刀具记录"
+            return jsonify(payload), 400
+        return jsonify(payload), 201
+
+    @app.get("/api/tool-life/records")
+    def list_tool_life_records():
+        return jsonify(db.list_tool_life_tools())
+
+    @app.get("/api/tool-life/records/<tool_id>")
+    def get_tool_life_records(tool_id):
+        row = db.get_tool_life_records(tool_id)
+        if not row:
+            return err(404, f"刀具 {tool_id} 无磨损记录")
+        return jsonify(row)
+
+    @app.post("/api/tool-life/predict")
+    def tool_life_predict_inline():
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
+        records = body.get("records")
+        tool_id = body.get("tool_id")
+        material = body.get("material")
+        if records is None and tool_id is not None:
+            stored = db.get_tool_life_records(str(tool_id))
+            if not stored:
+                return err(404, f"刀具 {tool_id} 无磨损记录，且请求未提供 records")
+            records = stored["records"]
+            material = material or stored.get("material")
+        if records is None:
+            return err(400, "需要 records（磨损记录数组）或已存刀具的 tool_id")
+        try:
+            report = predict_tool_life(
+                records, condition=body.get("condition"),
+                life_config=body.get("life_config"),
+                tool_id=tool_id, material=material)
+        except LifeValidationError as e:
+            return err(400, str(e), details=e.errors)
+        return maybe_download(report, f"tool_life_{tool_id or 'inline'}.json")
+
+    @app.post("/api/tool-life/predict/<tool_id>")
+    def tool_life_predict_saved(tool_id):
+        stored = db.get_tool_life_records(tool_id)
+        if not stored:
+            return err(404, f"刀具 {tool_id} 无磨损记录")
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
+        try:
+            report = predict_tool_life(
+                stored["records"], condition=body.get("condition"),
+                life_config=body.get("life_config"),
+                tool_id=tool_id, material=stored.get("material"))
+        except LifeValidationError as e:
+            return err(400, str(e), details=e.errors)
+        return maybe_download(report, f"tool_life_{tool_id}.json")
 
     # ---------------- 比对 --------------------------------------------- #
     @app.post("/api/compare")

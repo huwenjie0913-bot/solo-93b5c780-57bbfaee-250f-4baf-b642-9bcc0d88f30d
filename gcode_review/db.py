@@ -1,4 +1,4 @@
-"""SQLite 持久化：程序、版本化机床配置。仅使用标准库 sqlite3。"""
+"""SQLite 持久化：程序、版本化机床配置、刀具磨损记录。仅使用标准库 sqlite3。"""
 
 from __future__ import annotations
 
@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS machine_configs (
     note        TEXT DEFAULT '',
     created_at  REAL NOT NULL,
     UNIQUE(name, version)
+);
+CREATE TABLE IF NOT EXISTS tool_life_records (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_id          TEXT NOT NULL,
+    material         TEXT DEFAULT '',
+    cutting_time_min REAL NOT NULL,
+    wear_mm          REAL NOT NULL,
+    speed_rpm        REAL,
+    feed_mm_min      REAL,
+    depth_mm         REAL,
+    created_at       REAL NOT NULL,
+    UNIQUE(tool_id, cutting_time_min)
 );
 """
 
@@ -128,5 +140,53 @@ class Database:
         rows = self._conn.execute(
             "SELECT id, name, version, note, created_at FROM machine_configs"
             " ORDER BY name, version"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    def upsert_tool_life_records(self, tool_id: str, material: str,
+                                 records: List[Dict[str, Any]]) -> int:
+        """批量写入某刀具的磨损记录（同切削时间的旧记录被覆盖）。返回写入条数。"""
+        now = time.time()
+        for rec in records:
+            self._conn.execute(
+                "INSERT INTO tool_life_records(tool_id, material, cutting_time_min,"
+                " wear_mm, speed_rpm, feed_mm_min, depth_mm, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(tool_id, cutting_time_min) DO UPDATE SET"
+                " material=excluded.material, wear_mm=excluded.wear_mm,"
+                " speed_rpm=excluded.speed_rpm, feed_mm_min=excluded.feed_mm_min,"
+                " depth_mm=excluded.depth_mm",
+                (tool_id, material, rec["cutting_time_min"], rec["wear_mm"],
+                 rec.get("speed_rpm"), rec.get("feed_mm_min"),
+                 rec.get("depth_mm"), now),
+            )
+        self._conn.commit()
+        return len(records)
+
+    def get_tool_life_records(self, tool_id: str) -> Optional[Dict[str, Any]]:
+        """取某刀具的全部磨损记录（按切削时间升序）；无记录返回 None。"""
+        rows = self._conn.execute(
+            "SELECT * FROM tool_life_records WHERE tool_id=?"
+            " ORDER BY cutting_time_min", (tool_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        records = [{
+            "cutting_time_min": r["cutting_time_min"],
+            "wear_mm": r["wear_mm"],
+            "speed_rpm": r["speed_rpm"],
+            "feed_mm_min": r["feed_mm_min"],
+            "depth_mm": r["depth_mm"],
+        } for r in rows]
+        return {"tool_id": tool_id, "material": rows[-1]["material"],
+                "record_count": len(records), "records": records}
+
+    def list_tool_life_tools(self) -> List[Dict[str, Any]]:
+        """刀具磨损记录汇总列表。"""
+        rows = self._conn.execute(
+            "SELECT tool_id, MAX(material) AS material, COUNT(*) AS record_count,"
+            " MAX(wear_mm) AS max_wear_mm, MAX(created_at) AS updated_at"
+            " FROM tool_life_records GROUP BY tool_id ORDER BY tool_id"
         ).fetchall()
         return [dict(r) for r in rows]
