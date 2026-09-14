@@ -65,6 +65,7 @@ class Diagnostic:
     basis: str                           # 判定依据（算式、模态、阈值）
     preceding_state: Dict[str, Any] = field(default_factory=dict)  # 前置状态
     segment_index: Optional[int] = None  # 关联运动段（若有）
+    details: Dict[str, Any] = field(default_factory=dict)  # 结构化附加数据（如碰撞详情）
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

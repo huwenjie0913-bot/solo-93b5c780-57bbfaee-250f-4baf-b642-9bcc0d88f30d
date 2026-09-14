@@ -11,6 +11,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .collision import (aabb_gap, densify_polyline, first_crossing,
+                        last_crossing, lerp3, obstacle_aabb, obstacle_usable,
+                        swept_aabb, swept_clearance)
 from .config import WORK_OFFSET_KEYS, normalize_config, tool_length, cutter_radius
 from .geometry import PLANE_AXES, PLANE_CENTER_WORDS, resolve_arc
 from .parser import parse_program
@@ -19,6 +22,15 @@ from .types import Diagnostic, Move
 _AXES = ("x", "y", "z")
 _AXIS_WORDS = {"x": "X", "y": "Y", "z": "Z"}
 _INCH = 25.4
+
+# 刀具组件（自刀尖向上堆叠）：(组件名, 直径字段, 长度字段, 中文名)
+_TOOL_COMPONENTS = (
+    ("flute", "flute_diameter", "flute_length", "刃部"),
+    ("shank", "shank_diameter", "shank_length", "刀杆"),
+    ("holder", "holder_diameter", "holder_length", "刀柄"),
+)
+_COMPONENT_CN = {name: cn for name, _d, _l, cn in _TOOL_COMPONENTS}
+_KIND_CN = {"rapid": "快移", "linear": "直线", "arc": "圆弧"}
 
 
 def _fmt(v: Optional[float]) -> str:
@@ -618,6 +630,7 @@ class ReviewEngine:
             self.work_bounds.add(p)
 
         self._check_envelope(move, samples_machine, pre, line_no)
+        self._check_obstacle_collision(move, samples_machine, pre, line_no)
         if kind == "rapid":
             self._check_rapid_safety(samples_work, pre, line_no, idx, note)
         return move
@@ -694,6 +707,144 @@ class ReviewEngine:
             f"该快移段 z 范围 {_fmt(zmin)}~{_fmt(zmax)}mm，"
             f"XY{'有' if xy_moving else '无'}联动、方向{'下插' if descending else '上抬'}；{risk}",
             pre_state=pre, segment_index=seg_idx)
+
+    # ------------------------------------------------------------------ #
+    # 障碍物碰撞检查（刀具组件扫掠体）
+    # ------------------------------------------------------------------ #
+    def _tool_assembly(self) -> Optional[Dict[str, Any]]:
+        """当前刀具的组件圆柱模型。
+
+        参考点 = 引擎跟踪的机床坐标点（G43/G44 激活时即主轴端面/规线）。
+        刀尖 = 参考点 z − 生效长度补偿；组件自刀尖向上堆叠：刃 → 刀杆 → 刀柄。
+        无刀具或未定义刀具时返回 None（无法建模，跳过碰撞检查）。
+        """
+        if self.tool_no is None:
+            return None
+        tool = self.cfg.get("tools", {}).get(str(self.tool_no))
+        if not isinstance(tool, dict):
+            return None
+        tip = -self._active_length()
+        comps = []
+        z = tip
+        for name, dkey, lkey, _cn in _TOOL_COMPONENTS:
+            length = tool.get(lkey) or 0.0
+            dia = tool.get(dkey) or 0.0
+            if length > 1e-9 and dia > 1e-9:
+                comps.append({"name": name, "radius": dia / 2.0,
+                              "z_lo": z, "z_hi": z + length})
+            z += length
+        if not comps:
+            return None
+        return {"tip_offset": tip, "components": comps}
+
+    def _check_obstacle_collision(self, move, samples, pre, line_no) -> None:
+        """按可配置最大步长细分轨迹，逐段求组件扫掠体与障碍物的相交/最小间隙。
+
+        同一运动段内、同一 (障碍物, 组件) 的连续命中合并为一条诊断，
+        记录首次/末次接触的机床坐标（刀具参考点）。
+        """
+        if not self.cfg.get("check_obstacle_collision", True):
+            return
+        raw_obstacles = self.cfg.get("obstacles") or []
+        if not raw_obstacles or move.kind == "dwell" or len(samples) < 2:
+            return
+        assembly = self._tool_assembly()
+        if assembly is None:
+            return
+        obstacles = [ob for ob in raw_obstacles if obstacle_usable(ob)]
+        if not obstacles:
+            return
+        step = float(self.cfg.get("collision_max_step") or 2.0)
+        step = min(max(step, 1e-3), 1000.0)
+        warn = max(0.0, float(self.cfg.get("collision_clearance_warn") or 0.0))
+
+        pts = densify_polyline(samples, step)
+        ob_bounds = [(ob, obstacle_aabb(ob)) for ob in obstacles]
+        open_hits: Dict[tuple, dict] = {}   # (障碍物id, 组件) -> 进行中的命中
+        closed: List[dict] = []
+        for a, b in zip(pts, pts[1:]):
+            current: Dict[tuple, tuple] = {}
+            for comp in assembly["components"]:
+                bb = swept_aabb(a, b, comp["radius"], comp["z_lo"], comp["z_hi"])
+                for ob, obb in ob_bounds:
+                    key = (ob["id"], comp["name"])
+                    if key in current:
+                        continue
+                    # 宽相位：包围盒间距已超告警阈值则不必精算
+                    if aabb_gap(bb, obb) > warn + 1e-9:
+                        continue
+                    d, t = swept_clearance(a, b, comp["radius"],
+                                           comp["z_lo"], comp["z_hi"], ob)
+                    if d <= warn + 1e-9:
+                        current[key] = (d, t, a, b)
+            # 未继续命中的连续段在此结束
+            for key in list(open_hits):
+                if key not in current:
+                    closed.append(open_hits.pop(key))
+            for key, (d, t, a, b) in current.items():
+                hit = open_hits.get(key)
+                if hit is None:
+                    open_hits[key] = {"ob": key[0], "comp": key[1], "min": d,
+                                      "first_seg": (a, b, t), "last_seg": (a, b, t)}
+                else:
+                    if d < hit["min"]:
+                        hit["min"] = d
+                    hit["last_seg"] = (a, b, t)
+        closed.extend(open_hits.values())
+
+        if not closed:
+            return
+        ob_by_id = {ob["id"]: ob for ob in obstacles}
+        comp_by_name = {c["name"]: c for c in assembly["components"]}
+        for hit in closed:
+            oid, cname = hit["ob"], hit["comp"]
+            comp = comp_by_name[cname]
+            ob = ob_by_id[oid]
+            intersect = hit["min"] <= 1e-6
+            clearance = round(max(hit["min"], 0.0), 4)
+            severity = "error" if intersect else "warning"
+            # 首次/末次接触：进入/离开「间隙 ≤ 告警阈值」区域的精确位置
+            fa, fb, ft = hit["first_seg"]
+            la, lb, lt = hit["last_seg"]
+            t_first = first_crossing(fa, fb, ft, comp["radius"],
+                                     comp["z_lo"], comp["z_hi"], ob, warn)
+            t_last = last_crossing(la, lb, lt, comp["radius"],
+                                   comp["z_lo"], comp["z_hi"], ob, warn)
+            first = {a: round(v, 4) for a, v in lerp3(fa, fb, t_first).items()}
+            last = {a: round(v, 4) for a, v in lerp3(la, lb, t_last).items()}
+            kind_cn = _KIND_CN.get(move.kind, move.kind)
+            comp_cn = _COMPONENT_CN[cname]
+            if intersect:
+                msg = (f"第 {line_no} 行{kind_cn}段刀具{comp_cn}（T{self.tool_no}）"
+                       f"与障碍物 {oid} 相交")
+            else:
+                msg = (f"第 {line_no} 行{kind_cn}段刀具{comp_cn}（T{self.tool_no}）"
+                       f"与障碍物 {oid} 最小间隙 {clearance}mm，"
+                       f"低于告警阈值 {warn:g}mm")
+            basis = (
+                f"刀具 T{self.tool_no} {comp_cn}组件：半径 {comp['radius']:g}mm，"
+                f"轴向区间 [{comp['z_lo']:g}, {comp['z_hi']:g}]mm"
+                f"（相对刀具参考点，刀尖位于 {assembly['tip_offset']:g}mm）；"
+                f"轨迹按最大步长 {step:g}mm 细分后逐段求扫掠体与障碍物"
+                f"（{ob['type']}）的最小间隙={clearance}mm"
+                f"（{'≤0 判定相交' if intersect else f'告警阈值 collision_clearance_warn={warn:g}mm'}）；"
+                f"首次接触机床坐标 ({first['x']:g}, {first['y']:g}, {first['z']:g})，"
+                f"末次接触 ({last['x']:g}, {last['y']:g}, {last['z']:g})"
+                f"（进入/离开间隙告警阈值带的刀具参考点位置；阈值设为 0 时即精确接触点）")
+            self._diag(
+                "OBSTACLE_COLLISION", severity, line_no, msg, basis,
+                pre_state=pre, segment_index=move.index,
+                details={
+                    "obstacle_id": oid,
+                    "obstacle_type": ob["type"],
+                    "component": cname,
+                    "tool": self.tool_no,
+                    "move_kind": move.kind,
+                    "intersection": intersect,
+                    "min_clearance_mm": clearance,
+                    "first_contact_machine": first,
+                    "last_contact_machine": last,
+                })
 
     # ------------------------------------------------------------------ #
     # 固定循环
@@ -1095,11 +1246,12 @@ class ReviewEngine:
         }
 
     def _diag(self, code, severity, line_no, message, basis,
-              pre_state=None, segment_index=None) -> None:
+              pre_state=None, segment_index=None, details=None) -> None:
         self.diags.append(Diagnostic(
             code=code, severity=severity, line_no=line_no,
             message=message, basis=basis,
             preceding_state=pre_state or {}, segment_index=segment_index,
+            details=details or {},
         ))
 
     def _build_report(self, text, filename, blocks) -> Dict[str, Any]:
@@ -1111,6 +1263,9 @@ class ReviewEngine:
                        key=lambda d: (severity_order.get(d.severity, 9),
                                       d.line_no or 0, d.code))
         total_time = self.t_rapid + self.t_cut + self.t_dwell + self.t_toolchange
+        coll_diags = [d for d in self.diags if d.code == "OBSTACLE_COLLISION"]
+        clearances = [d.details.get("min_clearance_mm") for d in coll_diags
+                      if d.details.get("min_clearance_mm") is not None]
         return {
             "filename": filename or "inline",
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
@@ -1127,6 +1282,15 @@ class ReviewEngine:
                 "warning" if counts["warning"] else "clean"),
             "diagnostic_counts": counts,
             "diagnostics": [d.to_dict() for d in diags],
+            "collisions": {
+                "obstacles_configured": len(self.cfg.get("obstacles") or []),
+                "incidents": len(coll_diags),
+                "intersections": sum(1 for d in coll_diags if d.severity == "error"),
+                "min_clearance_mm": (round(min(clearances), 4)
+                                     if clearances else None),
+                "max_step_mm": self.cfg.get("collision_max_step"),
+                "clearance_warn_mm": self.cfg.get("collision_clearance_warn"),
+            },
             "trajectory": {
                 "segments": len(self.moves),
                 "bounds_machine": self.machine_bounds.to_dict(),
