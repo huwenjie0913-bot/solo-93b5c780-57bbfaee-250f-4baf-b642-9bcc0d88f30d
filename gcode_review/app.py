@@ -11,6 +11,7 @@
 * POST /api/review                   即时审查（程序 id 或内联文本 + 配置）
 * POST /api/review/program/<pid>     已存程序审查（配置 id/name+version 或内联）
 * POST /api/compare                  同一程序两套配置的风险差异
+* POST /api/resume                   断点续跑审查（重放前缀 + 生成恢复前导段 + 复核）
 * POST /api/tool-life/records        批量导入刀具磨损记录
 * GET  /api/tool-life/records        刀具记录汇总列表
 * GET  /api/tool-life/records/<tid>  某刀具磨损记录详情
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from typing import Any, Dict, Tuple
 
@@ -32,6 +34,7 @@ from .config import (DEFAULT_CONFIG, ConfigValidationError, normalize_config,
                      validate_config)
 from .db import Database
 from .engine import review_program
+from .resume import ResumeValidationError, review_resume
 from .tool_life import LifeValidationError, predict_tool_life, validate_records
 
 
@@ -352,6 +355,49 @@ def create_app(db_path: str = None) -> Flask:
         except (ValueError, LookupError) as e:
             return config_exc_response(e)
         return jsonify(compare_reviews(content, cfg_a, cfg_b, filename=name))
+
+    # ---------------- 断点续跑 ----------------------------------------- #
+    @app.post("/api/resume")
+    def resume_review():
+        body = json_object()
+        if body is None:
+            return err(400, "请求体必须是 JSON 对象")
+        pid = body.get("program_id")
+        content = body.get("content")
+        name = body.get("name", "inline.gcode")
+        if pid is not None:
+            row = db.get_program(int(pid))
+            if not row:
+                return err(404, f"程序 {pid} 不存在")
+            content, name = row["content"], row["name"]
+        if not isinstance(content, str) or not content.strip():
+            return err(400, "需要 content（G-code 文本）或 program_id")
+        try:
+            cfg = resolve_config(body)
+        except (ValueError, LookupError) as e:
+            return config_exc_response(e)
+
+        resume_line = body.get("resume_line")
+        if not isinstance(resume_line, int) or isinstance(resume_line, bool) \
+                or resume_line < 1:
+            return err(400, "需要 resume_line（计划恢复执行的物理行号，从 1 开始的正整数）")
+
+        measured = body.get("measured_position")
+        if measured is not None and not isinstance(measured, dict):
+            return err(400, "measured_position 必须是含 x/y/z 机床坐标的对象")
+        tol = body.get("position_tolerance", 0.01)
+        if not isinstance(tol, (int, float)) or isinstance(tol, bool) \
+                or not math.isfinite(float(tol)) or tol < 0:
+            return err(400, "position_tolerance 必须是非负有限数值（mm）")
+
+        try:
+            report = review_resume(
+                content, cfg, resume_line=resume_line,
+                measured_position=measured,
+                position_tolerance=float(tol), filename=name)
+        except ResumeValidationError as e:
+            return err(400, str(e))
+        return jsonify(report)
 
     @app.errorhandler(404)
     def _404(_e):
